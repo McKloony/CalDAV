@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net6.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Ical.Net" Version="4.2.0" />
+    <PackageReference Include="RestSharp" Version="110.2.0" />
+    <PackageReference Include="vCardLib.dll" Version="4.0.3" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\SimpliMed.DavSync.Shared\SimpliMed.DavSync.Shared.csproj" />
+  </ItemGroup>
+
+</Project>
