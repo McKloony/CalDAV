@@ -304,6 +304,51 @@ namespace SimpliMed.DavSync.Services
         public DbAppointment GetAppointmentByGuid(string guid) => GetAppointment(guid, spToUse: "qryDAVTeGui");
         public DbAppointment GetAppointmentByDAVID(string david) => GetAppointment(david, spToUse: "qryDAVTeDav");
 
+        /// <summary>
+        /// Loads all GuiID and DAVID values from the appointments table in a single query.
+        /// Used for fast in-memory duplicate checking instead of individual SP calls per appointment.
+        /// </summary>
+        public (HashSet<string> guids, HashSet<string> davids) GetAllAppointmentIdentifiers()
+        {
+            var guids = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var davids = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            try
+            {
+                using (SqlCommand command = new SqlCommand(
+                    "SELECT GuiID, DAVID FROM dbo.Tabelle_PatientenWv WHERE Passiv = 0 AND (GuiID IS NOT NULL OR DAVID IS NOT NULL)", Connection))
+                {
+                    command.CommandType = CommandType.Text;
+                    command.CommandTimeout = 60;
+
+                    using (SqlDataReader reader = command.ExecuteReader())
+                    {
+                        while (reader.Read())
+                        {
+                            if (!reader.IsDBNull(0))
+                            {
+                                var guid = reader.GetString(0).Trim();
+                                if (!string.IsNullOrEmpty(guid))
+                                    guids.Add(guid);
+                            }
+                            if (!reader.IsDBNull(1))
+                            {
+                                var david = reader.GetString(1).Trim();
+                                if (!string.IsNullOrEmpty(david))
+                                    davids.Add(david);
+                            }
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                LogService.Instance.Log($"Failed to load appointment identifiers: {ex.Message}");
+            }
+
+            return (guids, davids);
+        }
+
         private DbAppointment GetAppointment(string guid, string spToUse)
         {
             DbAppointment dbAppointment = null;

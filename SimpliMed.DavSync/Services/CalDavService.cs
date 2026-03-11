@@ -84,6 +84,9 @@ namespace SimpliMed.DavSync.Services
                                                        .Where(_ => _.UserName == CurrentUser && _.IsCalendarEvent).ToList() ?? new();
             ProcessEvents();
 
+            // Pre-load ALL appointment GUIDs and DAVIDs once for fast in-memory duplicate checking
+            var (allGuids, allDavids) = SqlService.GetAllAppointmentIdentifiers();
+
             var activeEmployeeIds = new List<string>();
             var syncTasks = new List<Task>();
 
@@ -109,7 +112,7 @@ namespace SimpliMed.DavSync.Services
                             var davAppointments = await Client.GetEvents(employeeId);
 
                             await SyncEmployeeAppointmentsToDav(employeeId, employee.ID0, employeeNotifHrs, davAppointments);
-                            await SyncEmployeeAppointmentsFromDav(employeeId, employee.ID0, employeeNotifHrs, employee.ManNr, davAppointments);
+                            await SyncEmployeeAppointmentsFromDav(employeeId, employee.ID0, employeeNotifHrs, employee.ManNr, davAppointments, allGuids, allDavids);
                         }
                         catch (Exception ex)
                         {
@@ -246,7 +249,7 @@ namespace SimpliMed.DavSync.Services
             }
         }
 
-        public async Task SyncEmployeeAppointmentsFromDav(string employeeGuid, int employeeId, int employeeNotifHours, int employeeManNr, List<CalDavEvent?>? davAppointments = null)
+        public async Task SyncEmployeeAppointmentsFromDav(string employeeGuid, int employeeId, int employeeNotifHours, int employeeManNr, List<CalDavEvent?>? davAppointments = null, HashSet<string> allGuids = null, HashSet<string> allDavids = null)
         {
             try
             {
@@ -256,6 +259,12 @@ namespace SimpliMed.DavSync.Services
                 // when LiteDB etag is missing but appointment already exists in SQL
                 var dbAppointments = SqlService.GetAppointments(forEmployeeId: employeeId, ignoreAlreadySynced: false);
                 davAppointments ??= await Client.GetEvents(employeeGuid);
+
+                // Batch-load all etags for this employee from LiteDB (single lock acquisition)
+                var cachedEtags = LocalDbManager.Instance.GetAllAppointmentEtags(employeeGuid);
+
+                // Collect etags to bulk-write at the end (avoids repeated LiteDB lock contention)
+                var etagsToStore = new List<(string appointmentId, string etag)>();
 
                 foreach (var appointment in davAppointments)
                 {
@@ -286,19 +295,30 @@ namespace SimpliMed.DavSync.Services
                             endDateTime = endDateTime.SetHoursAndMinutes(09, 00);
                         }
 
-                        var etag = LocalDbManager.Instance.GetAppointmentEtag(simplimedGuid, employeeGuid);
+                        // Use in-memory cached etags instead of individual LiteDB queries
+                        cachedEtags.TryGetValue(simplimedGuid, out var etag);
+                        etag ??= string.Empty;
+
                         if (etag == string.Empty)
                         {
                             if (!existsInSimplimed)
                             {
-                                // Double-check: query DB directly to prevent duplicates after LiteDB data loss
-                                var existingByDavid = SqlService.GetAppointmentByDAVID(appointment.InternalGuid);
-                                var existingByGuid = SqlService.GetAppointmentByGuid(simplimedGuid);
-                                if (existingByDavid != null || existingByGuid != null)
+                                // Fast in-memory duplicate check using pre-loaded HashSets (no individual DB round-trips)
+                                bool existsInDb = (allGuids != null && allGuids.Contains(simplimedGuid)) ||
+                                                  (allDavids != null && allDavids.Contains(appointment.InternalGuid));
+
+                                // Fallback to individual queries only if HashSets were not provided
+                                if (!existsInDb && allGuids == null && allDavids == null)
                                 {
-                                    // Appointment exists in DB but was missing from filtered results or LiteDB - restore etag tracking
-                                    LogService.Instance.Log($"[CalDavService] Duplicate prevented for {appointment.InternalGuid} - already exists in DB. Restoring etag.");
-                                    LocalDbManager.Instance.StoreAppointmentInfo(CurrentUser, simplimedGuid, employeeGuid, appointment.Etag!);
+                                    var existingByDavid = SqlService.GetAppointmentByDAVID(appointment.InternalGuid);
+                                    var existingByGuid = SqlService.GetAppointmentByGuid(simplimedGuid);
+                                    existsInDb = existingByDavid != null || existingByGuid != null;
+                                }
+
+                                if (existsInDb)
+                                {
+                                    // Collect for bulk write instead of individual LiteDB calls
+                                    etagsToStore.Add((simplimedGuid, appointment.Etag!));
                                     continue;
                                 }
 
@@ -337,7 +357,7 @@ namespace SimpliMed.DavSync.Services
                                     Text = shouldSendNotifications ? DbProtocolEntry.NewAppointmentWithEmailNotifText(employeeNotifHours) : DbProtocolEntry.NewAppointmentWithoutEmailNotifText()
                                 });
 
-                                LocalDbManager.Instance.StoreAppointmentInfo(CurrentUser, simplimedGuid, employeeGuid, appointment.Etag!);
+                                etagsToStore.Add((simplimedGuid, appointment.Etag!));
 
                                 continue;
                             }
@@ -392,13 +412,20 @@ namespace SimpliMed.DavSync.Services
                                 Text = DbProtocolEntry.AppointmentDavMiscChangedText()
                             });
 
-                            LocalDbManager.Instance.StoreAppointmentInfo(CurrentUser, simplimedGuid, employeeGuid, appointment.Etag!);
+                            etagsToStore.Add((simplimedGuid, appointment.Etag!));
                         }
                     }
                     catch (Exception ex)
                     {
                         LogService.Instance.Log($"Exception occurred while syncing appointment {appointment.InternalGuid} from DAV for employee {employeeGuid}: {ex.GetType().Name}: {ex.Message}");
                     }
+                }
+
+                // Bulk-write all collected etags in a single transaction
+                if (etagsToStore.Count > 0)
+                {
+                    LogService.Instance.Log($"[CalDavService] Bulk-storing {etagsToStore.Count} etags for employee {employeeGuid}");
+                    LocalDbManager.Instance.BulkStoreAppointmentInfo(CurrentUser, employeeGuid, etagsToStore);
                 }
             }
             catch (Exception ex)
@@ -414,6 +441,9 @@ namespace SimpliMed.DavSync.Services
                 var appointments = SqlService.GetAppointments(forEmployeeId: employeeId);
                 employeeEvents ??= await Client.GetEvents(employeeGuid);
 
+                // Batch-load all etags for this employee (single LiteDB operation)
+                var cachedEtags = LocalDbManager.Instance.GetAllAppointmentEtags(employeeGuid);
+
                 foreach (var appointment in appointments)
                 {
                     try
@@ -422,7 +452,7 @@ namespace SimpliMed.DavSync.Services
                             .Where(_ => _.InternalGuid.FromNormalToSimplimedGuid() == appointment.GuiID || _.InternalGuid == appointment.DAVID)
                             .Count() > 0;
 
-                        var isInLocalDb = LocalDbManager.Instance.GetAppointmentEtag(appointment.GuiID, employeeGuid) != string.Empty;
+                        var isInLocalDb = cachedEtags.ContainsKey(appointment.GuiID);
 
                         if (appointment.Passiv == 1 && isAppointmentInDav)
                         {

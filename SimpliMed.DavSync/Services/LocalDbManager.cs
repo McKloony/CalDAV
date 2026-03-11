@@ -31,6 +31,33 @@ namespace SimpliMed.DavSync.Services
             }
         }
 
+        /// <summary>
+        /// Loads all etags for a given employee into a dictionary (AppointmentId -> Etag).
+        /// Use this to avoid repeated individual LiteDB queries in loops.
+        /// </summary>
+        public Dictionary<string, string> GetAllAppointmentEtags(string employeeId)
+        {
+            lock (_lock)
+            {
+                var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                try
+                {
+                    var col = _database.GetCollection<AppointmentEtag>("appointment_etags");
+                    var entries = col.Find(_ => _.EmployeeId == employeeId);
+                    foreach (var ent in entries)
+                    {
+                        if (!string.IsNullOrEmpty(ent.AppointmentId))
+                            result[ent.AppointmentId] = ent.LastAppointmentEtag;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    LogService.Instance.Log($"Failed to load etags for employee {employeeId}: {ex.Message}");
+                }
+                return result;
+            }
+        }
+
         public void StoreAppointmentInfo(string customerName, string appointmentId, string employeeId, string etag)
         {
             try
@@ -48,6 +75,44 @@ namespace SimpliMed.DavSync.Services
                 }
             }
             catch { LogService.Instance.Log("Failed to store appinfo for appId: " + appointmentId); }
+        }
+
+        /// <summary>
+        /// Bulk-stores multiple appointment etags in a single lock acquisition.
+        /// Uses DeleteMany + InsertBulk for maximum speed instead of per-item FindOne+Delete+Insert.
+        /// </summary>
+        public void BulkStoreAppointmentInfo(string customerName, string employeeId, List<(string appointmentId, string etag)> items)
+        {
+            if (items == null || items.Count == 0) return;
+
+            try
+            {
+                lock (_lock)
+                {
+                    var col = _database.GetCollection<AppointmentEtag>("appointment_etags");
+
+                    // Build a set of appointment IDs for fast lookup
+                    var appointmentIds = new HashSet<string>(items.Select(i => i.appointmentId), StringComparer.OrdinalIgnoreCase);
+
+                    // Delete all existing entries for this employee that we're about to replace
+                    col.DeleteMany(_ => _.EmployeeId == employeeId && appointmentIds.Contains(_.AppointmentId));
+
+                    // Bulk-insert all new entries at once
+                    var newEntries = items.Select(i => new AppointmentEtag
+                    {
+                        CustomerName = customerName,
+                        AppointmentId = i.appointmentId,
+                        EmployeeId = employeeId,
+                        LastAppointmentEtag = i.etag
+                    });
+
+                    col.InsertBulk(newEntries);
+                }
+            }
+            catch (Exception ex)
+            {
+                LogService.Instance.Log($"Failed to bulk store {items.Count} etags for employee {employeeId}: {ex.Message}");
+            }
         }
 
         public void RemoveAppointment(string appointmentId, string employeeId)
