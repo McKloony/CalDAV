@@ -371,7 +371,10 @@ namespace SimpliMed.DavSync.Services
                             //Appointment changed on DAV side, need to sync changes to SimpliMed
                             if (dbAppointment == null)
                             {
-                                LogService.Instance.Log("Error at etagChanged: DB appointment not found for appointment with internal guid " + appointment.InternalGuid);
+                                // Appointment was deleted from SQL Server but still exists in DAV and LiteDB.
+                                // Remove the stale LiteDB entry so this error does not repeat every sync cycle.
+                                LogService.Instance.Log("Cleaning up stale etag: DB appointment not found for " + appointment.InternalGuid + ", removing from local cache");
+                                LocalDbManager.Instance.RemoveAppointment(simplimedGuid, employeeGuid);
                                 continue;
                             }
 

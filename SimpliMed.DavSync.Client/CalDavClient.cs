@@ -4,6 +4,7 @@ using Ical.Net.Serialization;
 using SimpliMed.DavSync.Client.Model;
 using SimpliMed.DavSync.Shared.Services;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Xml.Linq;
 
 namespace SimpliMed.DavSync.Client
@@ -138,6 +139,9 @@ namespace SimpliMed.DavSync.Client
             if (response.IsSuccessStatusCode)
             {
                 var responseContent = await response.Content.ReadAsStringAsync();
+                // Strip invalid XML control characters (0x00-0x08, 0x0B, 0x0C, 0x0E-0x1F) that
+                // can appear in calendar data from mobile devices and break XML parsing
+                responseContent = Regex.Replace(responseContent, @"[\x00-\x08\x0B\x0C\x0E-\x1F]", string.Empty);
                 var responseXml = XElement.Parse(responseContent);
 
                 List<CalDavEvent?> events = new();
@@ -164,11 +168,16 @@ namespace SimpliMed.DavSync.Client
 
                     if (!string.IsNullOrEmpty(evtId) && !string.IsNullOrEmpty(etag) && !string.IsNullOrEmpty(calendarData))
                     {
+                        var calendarEvent = Calendar.Load(calendarData)?.Events?.FirstOrDefault();
+                        // Skip non-VEVENT entries (e.g. VTODOs from iOS reminders) to prevent NullReferenceExceptions
+                        if (calendarEvent == null)
+                            continue;
+
                         events.Add(new()
                         {
                             InternalGuid = evtId,
                             Etag = etag,
-                            Event = Calendar.Load(calendarData)?.Events?.FirstOrDefault()
+                            Event = calendarEvent
                         });
                     }
                 }
