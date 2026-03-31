@@ -111,7 +111,7 @@ namespace SimpliMed.DavSync.Client
             return (await GetEvents(calendarName, eventId))?.FirstOrDefault();
         }
 
-        public async Task<List<CalDavEvent?>?> GetEvents(string calendarName, string? eventId = null)
+        public async Task<List<CalDavEvent?>?> GetEvents(string calendarName, string? eventId = null, int pastDays = 30)
         {
             string requestUri = $"/dav.php/calendars/{User}/{calendarName}";
             if (!string.IsNullOrEmpty(eventId))
@@ -119,21 +119,62 @@ namespace SimpliMed.DavSync.Client
                 requestUri += $"/{eventId}.ics";
             }
 
-            var xmlBody = new XElement(
-                 XName.Get("propfind", "DAV:"),
-                 new XAttribute(XNamespace.Xmlns + "d", "DAV:"),
-                 new XAttribute(XNamespace.Xmlns + "cs", "http://calendarserver.org/ns/"),
-                 new XAttribute(XNamespace.Xmlns + "cal", "urn:ietf:params:xml:ns:caldav"),
-                 new XElement(XName.Get("prop", "DAV:"),
-                     new XElement(XName.Get("getetag", "DAV:")),
-                     new XElement(XName.Get("calendar-data", "urn:ietf:params:xml:ns:caldav"))
-                 )
-            );
+            HttpRequestMessage request;
 
-            var request = new HttpRequestMessage(new HttpMethod("PROPFIND"), requestUri)
+            if (string.IsNullOrEmpty(eventId))
             {
-                Content = new StringContent(xmlBody.ToString(), Encoding.UTF8, "text/xml")
-            };
+                // Use REPORT with calendar-query and time-range filter (RFC 4791)
+                // to only fetch events within the relevant sync window
+                XNamespace dav = "DAV:";
+                XNamespace cal = "urn:ietf:params:xml:ns:caldav";
+
+                var startUtc = DateTime.UtcNow.AddDays(-pastDays).ToString("yyyyMMdd'T'HHmmss'Z'");
+
+                var xmlBody = new XElement(cal + "calendar-query",
+                    new XAttribute(XNamespace.Xmlns + "d", "DAV:"),
+                    new XAttribute(XNamespace.Xmlns + "c", "urn:ietf:params:xml:ns:caldav"),
+                    new XElement(dav + "prop",
+                        new XElement(dav + "getetag"),
+                        new XElement(cal + "calendar-data")
+                    ),
+                    new XElement(cal + "filter",
+                        new XElement(cal + "comp-filter",
+                            new XAttribute("name", "VCALENDAR"),
+                            new XElement(cal + "comp-filter",
+                                new XAttribute("name", "VEVENT"),
+                                new XElement(cal + "time-range",
+                                    new XAttribute("start", startUtc)
+                                )
+                            )
+                        )
+                    )
+                );
+
+                request = new HttpRequestMessage(new HttpMethod("REPORT"), requestUri)
+                {
+                    Content = new StringContent(xmlBody.ToString(), Encoding.UTF8, "text/xml")
+                };
+                request.Headers.Add("Depth", "1");
+            }
+            else
+            {
+                // Single event fetch: use PROPFIND (no time filter needed)
+                var xmlBody = new XElement(
+                     XName.Get("propfind", "DAV:"),
+                     new XAttribute(XNamespace.Xmlns + "d", "DAV:"),
+                     new XAttribute(XNamespace.Xmlns + "cs", "http://calendarserver.org/ns/"),
+                     new XAttribute(XNamespace.Xmlns + "cal", "urn:ietf:params:xml:ns:caldav"),
+                     new XElement(XName.Get("prop", "DAV:"),
+                         new XElement(XName.Get("getetag", "DAV:")),
+                         new XElement(XName.Get("calendar-data", "urn:ietf:params:xml:ns:caldav"))
+                     )
+                );
+
+                request = new HttpRequestMessage(new HttpMethod("PROPFIND"), requestUri)
+                {
+                    Content = new StringContent(xmlBody.ToString(), Encoding.UTF8, "text/xml")
+                };
+            }
 
             var response = await Client.SendAsync(request);
             if (response.IsSuccessStatusCode)

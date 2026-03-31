@@ -13,6 +13,11 @@ namespace SimpliMed.DavSync.Services
 {
     public class CalDavService : IDisposable // Implement IDisposable
     {
+        // Max lengths matching SQL Server stored procedure parameter limits (qryDAVTeAdd)
+        // IDs exceeding these limits get truncated by SQL Server, causing duplicate detection failures
+        private const int MAX_GUIID_LENGTH = 70;
+        private const int MAX_DAVID_LENGTH = 100;
+
         // Limit concurrent employee syncs to avoid overwhelming SQL Server with too many connections
         private static readonly SemaphoreSlim _employeeSemaphore = new(4, 4);
 
@@ -271,9 +276,17 @@ namespace SimpliMed.DavSync.Services
                     try
                     {
                         var simplimedGuid = appointment.InternalGuid.FromNormalToSimplimedGuid();
+
+                        // Truncate IDs to match SQL Server SP parameter limits to ensure
+                        // consistent comparison with values already stored in the database
+                        var simplimedGuidDb = simplimedGuid.Length > MAX_GUIID_LENGTH
+                            ? simplimedGuid.Substring(0, MAX_GUIID_LENGTH) : simplimedGuid;
+                        var davidDb = appointment.InternalGuid.Length > MAX_DAVID_LENGTH
+                            ? appointment.InternalGuid.Substring(0, MAX_DAVID_LENGTH) : appointment.InternalGuid;
+
                         var dbAppointment = dbAppointments.FirstOrDefault(_ =>
-                            _.GuiID == simplimedGuid ||
-                            _.DAVID == appointment.InternalGuid ||
+                            _.GuiID == simplimedGuidDb ||
+                            _.DAVID == davidDb ||
                             _.GuiID == appointment.InternalGuid);
                         var existsInSimplimed = dbAppointment is not null;
 
@@ -296,7 +309,10 @@ namespace SimpliMed.DavSync.Services
                         }
 
                         // Use in-memory cached etags instead of individual LiteDB queries
-                        cachedEtags.TryGetValue(simplimedGuid, out var etag);
+                        // Try both full and truncated keys (etags may have been stored with either)
+                        cachedEtags.TryGetValue(simplimedGuidDb, out var etag);
+                        if (string.IsNullOrEmpty(etag) && simplimedGuidDb != simplimedGuid)
+                            cachedEtags.TryGetValue(simplimedGuid, out etag);
                         etag ??= string.Empty;
 
                         if (etag == string.Empty)
@@ -304,25 +320,27 @@ namespace SimpliMed.DavSync.Services
                             if (!existsInSimplimed)
                             {
                                 // Fast in-memory duplicate check using pre-loaded HashSets (no individual DB round-trips)
-                                bool existsInDb = (allGuids != null && allGuids.Contains(simplimedGuid)) ||
-                                                  (allDavids != null && allDavids.Contains(appointment.InternalGuid));
+                                // Use truncated IDs to match what SQL Server actually stores
+                                bool existsInDb = (allGuids != null && allGuids.Contains(simplimedGuidDb)) ||
+                                                  (allDavids != null && allDavids.Contains(davidDb));
 
                                 // Fallback to individual queries only if HashSets were not provided
                                 if (!existsInDb && allGuids == null && allDavids == null)
                                 {
-                                    var existingByDavid = SqlService.GetAppointmentByDAVID(appointment.InternalGuid);
-                                    var existingByGuid = SqlService.GetAppointmentByGuid(simplimedGuid);
+                                    var existingByDavid = SqlService.GetAppointmentByDAVID(davidDb);
+                                    var existingByGuid = SqlService.GetAppointmentByGuid(simplimedGuidDb);
                                     existsInDb = existingByDavid != null || existingByGuid != null;
                                 }
 
                                 if (existsInDb)
                                 {
                                     // Collect for bulk write instead of individual LiteDB calls
-                                    etagsToStore.Add((simplimedGuid, appointment.Etag!));
+                                    etagsToStore.Add((simplimedGuidDb, appointment.Etag!));
                                     continue;
                                 }
 
                                 // Not stored locally, appointment created locally by client from DAV, need to create in SimpliMed
+                                // Use truncated IDs to match SP parameter limits and ensure consistent lookups
                                 var newAppointment = new DbSpAppointment
                                 {
                                     IDM = employeeId,
@@ -334,8 +352,8 @@ namespace SimpliMed.DavSync.Services
                                     ChangeDate = DateTime.Now,
                                     LastModification = DateTime.Now,
                                     DAVChange = false,
-                                    GuiID = appointment.InternalGuid.FromNormalToSimplimedGuid(),
-                                    DAVID = appointment.InternalGuid,
+                                    GuiID = simplimedGuidDb,
+                                    DAVID = davidDb,
                                     IDKurz = appointment.Event.Summary,
                                     Kommentar = appointment.Event.Description + " " + string.Join(", ", appointment.Event.Comments).TrimEnd(' ').TrimEnd(','),
                                     ManNr = employeeManNr,
@@ -352,12 +370,12 @@ namespace SimpliMed.DavSync.Services
 
                                 SqlService.CreateProtocolEntry(new DbProtocolEntry
                                 {
-                                    AppointmentGuid = appointment.InternalGuid.FromNormalToSimplimedGuid(),
+                                    AppointmentGuid = simplimedGuidDb,
                                     AppointmentId = appointmentId,
                                     Text = shouldSendNotifications ? DbProtocolEntry.NewAppointmentWithEmailNotifText(employeeNotifHours) : DbProtocolEntry.NewAppointmentWithoutEmailNotifText()
                                 });
 
-                                etagsToStore.Add((simplimedGuid, appointment.Etag!));
+                                etagsToStore.Add((simplimedGuidDb, appointment.Etag!));
 
                                 continue;
                             }
@@ -374,7 +392,7 @@ namespace SimpliMed.DavSync.Services
                                 // Appointment was deleted from SQL Server but still exists in DAV and LiteDB.
                                 // Remove the stale LiteDB entry so this error does not repeat every sync cycle.
                                 LogService.Instance.Log("Cleaning up stale etag: DB appointment not found for " + appointment.InternalGuid + ", removing from local cache");
-                                LocalDbManager.Instance.RemoveAppointment(simplimedGuid, employeeGuid);
+                                LocalDbManager.Instance.RemoveAppointment(simplimedGuidDb, employeeGuid);
                                 continue;
                             }
 
@@ -397,7 +415,7 @@ namespace SimpliMed.DavSync.Services
                                 Datum = dbAppointment.Datum,
                                 DAVDate = DateTime.Now,
                                 LastModification = DateTime.Now,
-                                GuiID = simplimedGuid,
+                                GuiID = simplimedGuidDb,
                                 Betreff1 = summary,
                                 Kommentar = appointment.Event.Description,
                                 NotifySetDate = notifyDateTime.Value.DateTime,
@@ -410,12 +428,12 @@ namespace SimpliMed.DavSync.Services
 
                             SqlService.CreateProtocolEntry(new DbProtocolEntry
                             {
-                                AppointmentGuid = simplimedGuid,
+                                AppointmentGuid = simplimedGuidDb,
                                 AppointmentId = dbAppointment.ID2.HasValue ? dbAppointment.ID2.Value : -1,
                                 Text = DbProtocolEntry.AppointmentDavMiscChangedText()
                             });
 
-                            etagsToStore.Add((simplimedGuid, appointment.Etag!));
+                            etagsToStore.Add((simplimedGuidDb, appointment.Etag!));
                         }
                     }
                     catch (Exception ex)
@@ -451,8 +469,17 @@ namespace SimpliMed.DavSync.Services
                 {
                     try
                     {
+                        // Compare using truncated IDs to match what SQL Server stores
                         var isAppointmentInDav = employeeEvents
-                            .Where(_ => _.InternalGuid.FromNormalToSimplimedGuid() == appointment.GuiID || _.InternalGuid == appointment.DAVID)
+                            .Where(_ =>
+                            {
+                                var davGuid = _.InternalGuid.FromNormalToSimplimedGuid();
+                                if (davGuid.Length > MAX_GUIID_LENGTH) davGuid = davGuid.Substring(0, MAX_GUIID_LENGTH);
+                                var davId = _.InternalGuid.Length > MAX_DAVID_LENGTH
+                                    ? _.InternalGuid.Substring(0, MAX_DAVID_LENGTH) : _.InternalGuid;
+                                return davGuid == appointment.GuiID || davId == appointment.DAVID
+                                    || _.InternalGuid == appointment.DAVID;
+                            })
                             .Count() > 0;
 
                         var isInLocalDb = cachedEtags.ContainsKey(appointment.GuiID);
