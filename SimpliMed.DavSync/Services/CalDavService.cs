@@ -92,6 +92,9 @@ namespace SimpliMed.DavSync.Services
             // Pre-load ALL appointment GUIDs and DAVIDs once for fast in-memory duplicate checking
             var (allGuids, allDavids) = SqlService.GetAllAppointmentIdentifiers();
 
+            // Query once per mandant instead of once per employee
+            var shouldSendNotifications = SqlService.ShouldSendEmailNotification();
+
             var activeEmployeeIds = new List<string>();
             var syncTasks = new List<Task>();
 
@@ -116,8 +119,11 @@ namespace SimpliMed.DavSync.Services
                             // Load DAV events once and share between ToDav and FromDav
                             var davAppointments = await Client.GetEvents(employeeId);
 
-                            await SyncEmployeeAppointmentsToDav(employeeId, employee.ID0, employeeNotifHrs, davAppointments);
-                            await SyncEmployeeAppointmentsFromDav(employeeId, employee.ID0, employeeNotifHrs, employee.ManNr, davAppointments, allGuids, allDavids);
+                            // Load etags once and share between ToDav and FromDav (was queried twice before)
+                            var cachedEtags = LocalDbManager.Instance.GetAllAppointmentEtags(employeeId);
+
+                            await SyncEmployeeAppointmentsToDav(employeeId, employee.ID0, employeeNotifHrs, davAppointments, cachedEtags);
+                            await SyncEmployeeAppointmentsFromDav(employeeId, employee.ID0, employeeNotifHrs, employee.ManNr, shouldSendNotifications, davAppointments, cachedEtags, allGuids, allDavids);
                         }
                         catch (Exception ex)
                         {
@@ -126,20 +132,6 @@ namespace SimpliMed.DavSync.Services
                         finally
                         {
                             _employeeSemaphore.Release();
-                        }
-                    }));
-                }
-                else
-                {
-                    syncTasks.Add(Task.Run(async () =>
-                    {
-                        try
-                        {
-                            await Client.DeleteCalendar(employeeId);
-                        }
-                        catch (Exception ex)
-                        {
-                            LogService.Instance.Log($"Exception occurred while deleting calendar for employee {employeeId}: {ex.GetType().Name}: {ex.Message}");
                         }
                     }));
                 }
@@ -254,19 +246,17 @@ namespace SimpliMed.DavSync.Services
             }
         }
 
-        public async Task SyncEmployeeAppointmentsFromDav(string employeeGuid, int employeeId, int employeeNotifHours, int employeeManNr, List<CalDavEvent?>? davAppointments = null, HashSet<string> allGuids = null, HashSet<string> allDavids = null)
+        public async Task SyncEmployeeAppointmentsFromDav(string employeeGuid, int employeeId, int employeeNotifHours, int employeeManNr, bool shouldSendNotifications, List<CalDavEvent?>? davAppointments = null, Dictionary<string, string> cachedEtags = null, HashSet<string> allGuids = null, HashSet<string> allDavids = null)
         {
             try
             {
-                var shouldSendNotifications = SqlService.ShouldSendEmailNotification();
-
                 // FIX: Load ALL active appointments (not just unsynced) to prevent duplicate creation
                 // when LiteDB etag is missing but appointment already exists in SQL
                 var dbAppointments = SqlService.GetAppointments(forEmployeeId: employeeId, ignoreAlreadySynced: false);
                 davAppointments ??= await Client.GetEvents(employeeGuid);
 
-                // Batch-load all etags for this employee from LiteDB (single lock acquisition)
-                var cachedEtags = LocalDbManager.Instance.GetAllAppointmentEtags(employeeGuid);
+                // Use passed-in etags or load them (single lock acquisition)
+                cachedEtags ??= LocalDbManager.Instance.GetAllAppointmentEtags(employeeGuid);
 
                 // Collect etags to bulk-write at the end (avoids repeated LiteDB lock contention)
                 var etagsToStore = new List<(string appointmentId, string etag)>();
@@ -455,32 +445,41 @@ namespace SimpliMed.DavSync.Services
             }
         }
 
-        public async Task SyncEmployeeAppointmentsToDav(string employeeGuid, int employeeId, int employeeNotifHours, List<CalDavEvent?>? employeeEvents = null)
+        public async Task SyncEmployeeAppointmentsToDav(string employeeGuid, int employeeId, int employeeNotifHours, List<CalDavEvent?>? employeeEvents = null, Dictionary<string, string> cachedEtags = null)
         {
             try
             {
                 var appointments = SqlService.GetAppointments(forEmployeeId: employeeId);
                 employeeEvents ??= await Client.GetEvents(employeeGuid);
 
-                // Batch-load all etags for this employee (single LiteDB operation)
-                var cachedEtags = LocalDbManager.Instance.GetAllAppointmentEtags(employeeGuid);
+                // Use passed-in etags or load them (single LiteDB operation)
+                cachedEtags ??= LocalDbManager.Instance.GetAllAppointmentEtags(employeeGuid);
+
+                // Build HashSets from DAV events for O(1) lookup instead of O(n) per appointment
+                var davGuiIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                var davDavIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                var davRawIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var evt in employeeEvents)
+                {
+                    if (evt == null) continue;
+                    var davGuid = evt.InternalGuid.FromNormalToSimplimedGuid();
+                    if (davGuid.Length > MAX_GUIID_LENGTH) davGuid = davGuid.Substring(0, MAX_GUIID_LENGTH);
+                    davGuiIds.Add(davGuid);
+
+                    var davId = evt.InternalGuid.Length > MAX_DAVID_LENGTH
+                        ? evt.InternalGuid.Substring(0, MAX_DAVID_LENGTH) : evt.InternalGuid;
+                    davDavIds.Add(davId);
+                    davRawIds.Add(evt.InternalGuid);
+                }
 
                 foreach (var appointment in appointments)
                 {
                     try
                     {
-                        // Compare using truncated IDs to match what SQL Server stores
-                        var isAppointmentInDav = employeeEvents
-                            .Where(_ =>
-                            {
-                                var davGuid = _.InternalGuid.FromNormalToSimplimedGuid();
-                                if (davGuid.Length > MAX_GUIID_LENGTH) davGuid = davGuid.Substring(0, MAX_GUIID_LENGTH);
-                                var davId = _.InternalGuid.Length > MAX_DAVID_LENGTH
-                                    ? _.InternalGuid.Substring(0, MAX_DAVID_LENGTH) : _.InternalGuid;
-                                return davGuid == appointment.GuiID || davId == appointment.DAVID
-                                    || _.InternalGuid == appointment.DAVID;
-                            })
-                            .Count() > 0;
+                        // O(1) HashSet lookups instead of O(n) linear scan per appointment
+                        var isAppointmentInDav = davGuiIds.Contains(appointment.GuiID)
+                            || davDavIds.Contains(appointment.DAVID)
+                            || davRawIds.Contains(appointment.DAVID);
 
                         var isInLocalDb = cachedEtags.ContainsKey(appointment.GuiID);
 

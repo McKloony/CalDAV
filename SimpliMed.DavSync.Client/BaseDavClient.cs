@@ -5,6 +5,14 @@ namespace SimpliMed.DavSync.Client
 {
     public class BaseDavClient
     {
+        // Shared handler enables TCP connection pooling across all mandants
+        // (each HttpClient gets its own auth headers but reuses the same connections)
+        private static readonly HttpClientHandler SharedHandler = new()
+        {
+            ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator,
+            MaxConnectionsPerServer = 20
+        };
+
         protected HttpClient Client { get; set; }
 
         public string Host { get; set; }
@@ -20,12 +28,8 @@ namespace SimpliMed.DavSync.Client
                 throw new Exception("Host, User and Password must be set to connect via a DavClient.");
             }
 
-            var handler = new HttpClientHandler()
-            {
-                ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator
-            };
-
-            Client = new HttpClient(handler) { BaseAddress = new Uri(Host) };
+            // disposeHandler: false - shared handler must not be disposed when HttpClient is disposed
+            Client = new HttpClient(SharedHandler, disposeHandler: false) { BaseAddress = new Uri(Host) };
 
             var authHeader = new AuthenticationHeaderValue("Basic", Convert.ToBase64String(Encoding.UTF8.GetBytes($"{User}:{Password}")));
             Client.DefaultRequestHeaders.Authorization = authHeader;

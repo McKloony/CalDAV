@@ -14,6 +14,14 @@ namespace SimpliMed.DavSync.Services
         public LocalDbManager()
         {
             _database = new LiteDatabase(@"davsync.db");
+
+            // Create indexes for fast lookups (idempotent - safe to call on every startup)
+            var appointmentCol = _database.GetCollection<AppointmentEtag>("appointment_etags");
+            appointmentCol.EnsureIndex(_ => _.EmployeeId);
+            appointmentCol.EnsureIndex(_ => _.AppointmentId);
+
+            var contactCol = _database.GetCollection<ContactEtag>("contact_etags");
+            contactCol.EnsureIndex(_ => _.ContactId);
         }
 
         public string GetAppointmentEtag(string appointmentId, string employeeId)
@@ -120,11 +128,7 @@ namespace SimpliMed.DavSync.Services
             lock (_lock)
             {
                 var col = _database.GetCollection<AppointmentEtag>("appointment_etags");
-                var ent = col.FindOne(_ => _.AppointmentId == appointmentId && _.EmployeeId == employeeId);
-                if (ent is not null)
-                {
-                    col.Delete(ent.Id);
-                }
+                col.DeleteMany(_ => _.AppointmentId == appointmentId && _.EmployeeId == employeeId);
             }
         }
 
@@ -169,11 +173,7 @@ namespace SimpliMed.DavSync.Services
             lock (_lock)
             {
                 var col = _database.GetCollection<ContactEtag>("contact_etags");
-                var ent = col.FindOne(_ => _.ContactId == contactId);
-                if (ent is not null)
-                {
-                    col.Delete(ent.Id);
-                }
+                col.DeleteMany(_ => _.ContactId == contactId);
             }
         }
 

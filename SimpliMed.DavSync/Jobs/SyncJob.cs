@@ -2,24 +2,15 @@
 using SimpliMed.DavSync.Services;
 using SimpliMed.DavSync.Shared;
 using SimpliMed.DavSync.Shared.Services;
-using System.Diagnostics;
-using System.Threading.Tasks;
 using System.Collections.Concurrent;
-using System;
+using System.Diagnostics;
 
 namespace SimpliMed.DavSync.Jobs
 {
     [DisallowConcurrentExecution]
     public class SyncJob : IJob
     {
-        private static readonly SemaphoreSlim _semaphore = new(Config.MaxParallelTasks, Config.MaxParallelTasks); // Initialize on declaration
         private static readonly ConcurrentDictionary<string, SemaphoreSlim> _userLocks = new();
-
-        // No need to initialize these here.  They will be created in the SynchronizeUserAsync method.
-        //private CalDavService CalDavService { get; set; } = new();
-        //private CardDavService CardDavService { get; set; } = new();
-
-        private static readonly TimeSpan SyncLockTimeout = TimeSpan.FromSeconds(15);
 
         public async Task Execute(IJobExecutionContext context)
         {
@@ -34,7 +25,7 @@ namespace SimpliMed.DavSync.Jobs
                     ExternalActionsService.Instance.ExecuteActionsIfAvailable();
                 }
 
-                await Parallel.ForEachAsync(Config.DbsToSync, new ParallelOptions(), async (userName, cancellationToken) =>
+                await Parallel.ForEachAsync(Config.DbsToSync, new ParallelOptions { MaxDegreeOfParallelism = Config.MaxParallelTasks }, async (userName, cancellationToken) =>
                 {
                     await SynchronizeUserWrapperAsync(userName, cancellationToken);
                 });
@@ -51,28 +42,20 @@ namespace SimpliMed.DavSync.Jobs
 
         private async Task SynchronizeUserWrapperAsync(string userName, CancellationToken cancellationToken)
         {
+            // Per-user lock prevents the same mandant from running concurrently across overlapping sync cycles
             SemaphoreSlim userLock = _userLocks.GetOrAdd(userName, _ => new SemaphoreSlim(1, 1));
 
-            await userLock.WaitAsync(cancellationToken); // Get user Lock.
+            await userLock.WaitAsync(cancellationToken);
 
             try
             {
-                await _semaphore.WaitAsync(cancellationToken); // Get global concurrency semaphore
-
-                try
-                {
-                    await SynchronizeUserAsync(userName, cancellationToken);
-                }
-                finally
-                {
-                    _semaphore.Release(); // Release global semaphore
-                }
+                // MaxDegreeOfParallelism on ParallelOptions already limits concurrency
+                await SynchronizeUserAsync(userName, cancellationToken);
             }
             finally
             {
-                userLock.Release(); //Release user lock.
+                userLock.Release();
             }
-
         }
 
         private async Task SynchronizeUserAsync(string userName, CancellationToken cancellationToken)
@@ -91,15 +74,11 @@ namespace SimpliMed.DavSync.Jobs
                 return;
             }
 
-            //Create the CalDavService and CardDavService here, within the user's lock. This ensures each user has its own instance.
             using (var calDavService = new CalDavService())
-            using (var cardDavService = new CardDavService())
             {
                 try
                 {
-                    //Initialize the services.
                     await calDavService.InitializeConnection(userName, unitTypeConnectionString.ConnectionString + "MultipleActiveResultSets=True;");
-               //     await cardDavService.InitializeConnection(userName, unitTypeConnectionString.ConnectionString + "MultipleActiveResultSets=True;");
                 }
                 catch (Exception ex)
                 {
